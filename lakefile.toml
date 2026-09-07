@@ -1,0 +1,10 @@
+name = "CLAI"
+version = "0.1.0"
+defaultTargets = ["clai"]
+
+[[require]]
+name = "mathlib"
+
+[[lean_exe]]
+name = "clai"
+root = "Main"
