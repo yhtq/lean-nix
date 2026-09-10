@@ -20,6 +20,11 @@
         "x86_64-linux"
       ];
 
+      flake.templates.default = {
+        path = ./.;
+        description = "Lean 4 project using nixpkgs leanPackages";
+      };
+
       perSystem =
         { pkgs, ... }:
         let
