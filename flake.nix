@@ -23,32 +23,38 @@
       perSystem =
         { pkgs, ... }:
         let
-          projectSrc = ./.;
+          projectSrc = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              pkgs.lib.cleanSourceFilter path type
+              && builtins.baseNameOf path != ".lake"
+              && builtins.baseNameOf path != "result";
+          };
+          packageNames = [
+            "mathlib"
+            "plausible"
+            "LeanSearchClient"
+            "importGraph"
+            "proofwidgets"
+            "aesop"
+            "Qq"
+            "batteries"
+            "Cli"
+          ];
         in
         {
           packages.mathlib = pkgs.leanPackages.mathlib;
           packages.mathlibDeps = pkgs.linkFarm "lean4-mathlib-deps" (
-            map
-              (name: {
-                inherit name;
-                path = pkgs.leanPackages.${name};
-              })
-              [
-                "mathlib"
-                "plausible"
-                "LeanSearchClient"
-                "importGraph"
-                "proofwidgets"
-                "aesop"
-                "Qq"
-                "batteries"
-                "Cli"
-              ]
+            map (name: {
+              inherit name;
+              path = pkgs.leanPackages.${name};
+            }) packageNames
           );
 
-          # `buildLakePackage` currently triggers Lake to write native artifacts
-          # into the read-only Mathlib store path (nixpkgs#550523). Elaborating
-          # the project still verifies all Lean imports without that invalid write.
+          # nixpkgs#550523 prevents buildLakePackage from writing native Lake
+          # artifacts into immutable dependency paths. This still verifies all
+          # project imports against the nixpkgs-provided Mathlib.
           packages.default =
             pkgs.runCommand "CLAI-0.1.0"
               {
@@ -63,59 +69,116 @@
                 cp -r ${projectSrc}/. "$out/"
               '';
 
-          apps.linkLakeDeps = {
+          apps.mountLakeDeps = {
             type = "app";
             program = "${
               pkgs.writeShellApplication {
-                name = "link-lake-deps";
+                name = "mount-lake-deps";
                 runtimeInputs = [
-                  pkgs.nix
                   pkgs.coreutils
                   pkgs.findutils
+                  pkgs.fuse-overlayfs
+                  pkgs.util-linux
                 ];
                 text = ''
+                  packages=(mathlib plausible LeanSearchClient importGraph proofwidgets aesop Qq batteries Cli)
                   if [ ! -f flake.nix ] || [ ! -f lake-manifest.json ]; then
                     echo "Run this command from the CLAI project root." >&2
                     exit 1
                   fi
 
                   nix build .#mathlibDeps --out-link .lake/nix-deps
-                  mkdir -p .lake/packages
+                  mkdir -p .lake/packages .lake/fuse-upper .lake/fuse-work .lake/fuse-logs
 
-                  # Each package directory is its own copy-on-write overlay.
-                  # Sources and prebuilt Lean artifacts remain links into the
-                  # Nix store; native `.c.o.export` files are written locally.
-                  for package in mathlib plausible LeanSearchClient importGraph proofwidgets aesop Qq batteries Cli; do
-                    destination=".lake/packages/$package"
-                    if [ -L "$destination" ]; then
-                      rm "$destination"
+                  for package in "''${packages[@]}"; do
+                    mountpoint=".lake/packages/$package"
+                    upper=".lake/fuse-upper/$package"
+                    work=".lake/fuse-work/$package"
+
+                    if mountpoint -q "$mountpoint"; then
+                      echo "Already mounted: $mountpoint"
+                      continue
                     fi
-                    if [ ! -e "$destination" ]; then
-                      package_store="$(readlink -f ".lake/nix-deps/$package")"
-                      mkdir -p "$destination"
-                      cp -as "$package_store"/. "$destination"
+                    if [ -L "$mountpoint" ]; then
+                      rm "$mountpoint"
                     fi
-                    if [ ! -d "$destination" ]; then
-                      echo "Expected package directory: $destination" >&2
+                    if [ -e "$mountpoint" ] && [ ! -e "$upper" ]; then
+                      mv "$mountpoint" "$upper"
+                    elif [ -e "$mountpoint" ] && [ -e "$upper" ]; then
+                      if [ -n "$(find "$mountpoint" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+                        echo "Both $mountpoint and $upper contain data; refusing to discard artifacts." >&2
+                        exit 1
+                      fi
+                      rmdir "$mountpoint"
+                    fi
+
+                    packageStore="$(readlink -f ".lake/nix-deps/$package")"
+                    mkdir -p "$upper" "$mountpoint"
+                    # Remove old file-level COW links. The FUSE lowerdir will
+                    # provide those files directly; upperdir keeps local output.
+                    find "$upper" -type l -delete
+                    # FUSE copy-up retains Nix store's 0555 directory mode. A
+                    # writable upperdir skeleton prevents compiler write errors
+                    # without copying any source or prebuilt Lean artifacts.
+                    find "$packageStore" -type d -print0 | while IFS= read -r -d $'\0' directory; do
+                      relative="''${directory#"$packageStore"/}"
+                      if [ "$directory" = "$packageStore" ]; then
+                        chmod u+rwx "$upper"
+                      else
+                        mkdir -p "$upper/$relative"
+                        chmod u+rwx "$upper/$relative"
+                      fi
+                    done
+
+                    rm -rf "$work"
+                    mkdir -p "$work"
+                    export PATH=/run/wrappers/bin:$PATH
+                    nohup fuse-overlayfs \
+                      -o "lowerdir=$packageStore,upperdir=$upper,workdir=$work" \
+                      "$mountpoint" > ".lake/fuse-logs/$package.log" 2>&1 &
+                    for _ in 1 2 3 4 5; do
+                      mountpoint -q "$mountpoint" && break
+                      sleep 1
+                    done
+                    if ! mountpoint -q "$mountpoint"; then
+                      cat ".lake/fuse-logs/$package.log" >&2 || true
+                      echo "Failed to mount $mountpoint" >&2
                       exit 1
-                    fi
-
-                    # `cp -a` preserves the store's read-only directory modes.
-                    # Alter directories only; linked files stay immutable.
-                    find "$destination" -type d -exec chmod u+rwx {} +
-                    if [ -d "$destination/.lake/build/ir" ]; then
-                      find "$destination/.lake/build/ir" -type l -name '*.c.o.export' -delete
                     fi
                   done
                 '';
               }
-            }/bin/link-lake-deps";
+            }/bin/mount-lake-deps";
+          };
+
+          apps.unmountLakeDeps = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "unmount-lake-deps";
+                runtimeInputs = [
+                  pkgs.fuse3
+                  pkgs.util-linux
+                ];
+                text = ''
+                  for package in mathlib plausible LeanSearchClient importGraph proofwidgets aesop Qq batteries Cli; do
+                    mountpoint=".lake/packages/$package"
+                    if mountpoint -q "$mountpoint"; then
+                      fusermount3 -u "$mountpoint"
+                    fi
+                  done
+                '';
+              }
+            }/bin/unmount-lake-deps";
           };
 
           devShells.default = pkgs.mkShell {
-            packages = with pkgs.leanPackages; [
-              lean4
-              mathlib
+            packages = with pkgs; [
+              leanPackages.lean4
+              leanPackages.mathlib
+              fuse-overlayfs
+              fuse3
+              util-linux
             ];
           };
         };
