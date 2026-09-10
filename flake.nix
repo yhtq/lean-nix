@@ -177,8 +177,6 @@
               leanPackages.lean4
               leanPackages.mathlib
               fuse-overlayfs
-              fuse3
-              util-linux
             ];
           };
         };
